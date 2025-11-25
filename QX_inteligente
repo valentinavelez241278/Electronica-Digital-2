@@ -1,0 +1,511 @@
+# main_dashboard_fixed.py
+# MicroPython v1.26.1 - ESP32S
+# LEDs via value(), buzzer pasivo con PWM asincrónico y control de tareas
+
+import time
+import ujson
+import network
+import ubinascii
+import uasyncio as asyncio
+import socket
+import machine
+from machine import Pin, PWM, I2C
+import dht
+import os
+
+# ------------- USER CONFIG - REPLACE THESE -------------
+WIFI_SSID = "Infinix HOT 40i"
+WIFI_PASS = "conecty2024"
+
+TELEGRAM_TOKEN = "8478234780:AAH9tD3weQ_uroI8niXb06NSdKigsZ50txs"
+TELEGRAM_CHAT_ID = "8275251794"
+# -------------------------------------------------------
+
+DEVICE_ID = ubinascii.hexlify(machine.unique_id()).decode()
+SAMPLE_INTERVAL = 4  # seconds sensor loop
+
+# Default thresholds (will be overwritten by thresholds.json if exists)
+thresholds = {
+    "temp_high": 30.0,
+    "temp_low": 18.0,
+    "hum_high": 70.0,
+    "hum_low": 20.0,
+    "lux_low": 50.0
+}
+
+THRESHOLDS_FILE = "thresholds.json"
+
+def load_thresholds():
+    global thresholds
+    try:
+        if THRESHOLDS_FILE in os.listdir():
+            with open(THRESHOLDS_FILE, "r") as f:
+                data = ujson.loads(f.read())
+                for k in thresholds:
+                    if k in data:
+                        thresholds[k] = float(data[k])
+            print("Thresholds loaded:", thresholds)
+        else:
+            save_thresholds()
+    except Exception as e:
+        print("Load thresholds error:", e)
+
+def save_thresholds():
+    try:
+        with open(THRESHOLDS_FILE, "w") as f:
+            f.write(ujson.dumps(thresholds))
+        print("Thresholds saved.")
+    except Exception as e:
+        print("Save thresholds error:", e)
+
+# ------------- HARDWARE SETUP -------------
+# sensors
+dht_sensor = dht.DHT22(Pin(32))
+pir = Pin(25, Pin.IN)
+
+# I2C & BH1750 (optional)
+i2c = I2C(0, scl=Pin(22), sda=Pin(21))
+class BH1750:
+    CONT_HIRES = 0x10
+    PWR_ON = 0x01
+    RESET = 0x07
+    def _init_(self, i2c, addr=0x23):
+        self.i2c = i2c
+        self.addr = addr
+        try:
+            self.i2c.writeto(self.addr, bytes([self.PWR_ON]))
+            time.sleep_ms(10)
+            self.i2c.writeto(self.addr, bytes([self.RESET]))
+            time.sleep_ms(10)
+        except Exception as e:
+            print("BH1750 init error:", e)
+    def luminance(self):
+        try:
+            self.i2c.writeto(self.addr, bytes([self.CONT_HIRES]))
+            time.sleep_ms(180)
+            data = self.i2c.readfrom(self.addr, 2)
+            val = (data[0] << 8) | data[1]
+            return val / 1.2
+        except Exception:
+            return None
+
+light_sensor = None
+
+# actuators - use value(1/0)
+led_red = Pin(4, Pin.OUT, value=0)
+led_pink = Pin(17, Pin.OUT, value=0)
+led_green = Pin(16, Pin.OUT, value=0)
+
+def led_on(pin):
+    try:
+        pin.value(1)
+    except Exception:
+        try:
+            pin.on()
+        except:
+            pass
+
+def led_off(pin):
+    try:
+        pin.value(0)
+    except Exception:
+        try:
+            pin.off()
+        except:
+            pass
+
+# buzzer: passive -> PWM controlled (no blocking)
+buzzer = PWM(Pin(12))
+buzzer.duty_u16(0)
+
+# servo
+servo = PWM(Pin(14), freq=50)
+servo.duty_u16(0)
+
+# buttons
+btn_silence = Pin(26, Pin.IN, Pin.PULL_UP)
+btn_panic = Pin(13, Pin.IN, Pin.PULL_UP)
+
+# ------------- STATE -------------
+state = {
+    "temp": None,
+    "hum": None,
+    "lux": None,
+    "presence": False,
+    "alarm_active": False,
+    "alarm_silenced": False,
+    "last_alarm": "",
+    "panic": False
+}
+
+# buzzer task handle to avoid overlapping sounds
+buzzer_task = None
+
+# ------------- UTILS -------------
+def wifi_connect_blocking(timeout=20):
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)
+    time.sleep(0.2)
+    wlan.active(True)
+    wlan.disconnect()
+    time.sleep(0.2)
+    print("Connecting to WiFi...")
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    t0 = time.time()
+    while not wlan.isconnected():
+        if time.time() - t0 > timeout:
+            print("WiFi connect timeout")
+            return None
+        time.sleep(0.5)
+    print("WiFi:", wlan.ifconfig())
+    return wlan.ifconfig()[0]
+
+def servo_set(angle):
+    min_us = 500
+    max_us = 2500
+    us = min_us + (angle / 180) * (max_us - min_us)
+    duty = int(us / 20000 * 65535)
+    try:
+        servo.duty_u16(duty)
+    except Exception:
+        pass
+
+# ------------- ASYNC BUZZER (for passive buzzer) -------------
+async def buzzer_tone(freq, duration):
+    try:
+        buzzer.freq(int(freq))
+        buzzer.duty_u16(32768)  # 50% duty
+        await asyncio.sleep(duration)
+        buzzer.duty_u16(0)
+    except Exception:
+        try:
+            buzzer.duty_u16(0)
+        except:
+            pass
+
+async def buzzer_alarm_pattern_async(temp_out, hum_out, lux_out):
+    # avoid overlapping: short sleep between tones
+    try:
+        if temp_out and hum_out and lux_out:
+            await buzzer_tone(1500, 0.18); await asyncio.sleep(0.06)
+            await buzzer_tone(900, 0.18); await asyncio.sleep(0.06)
+            await buzzer_tone(700, 0.25)
+        elif temp_out and hum_out:
+            await buzzer_tone(1400, 0.22); await asyncio.sleep(0.08)
+            await buzzer_tone(1000, 0.22)
+        elif temp_out:
+            await buzzer_tone(1300, 0.4)
+        elif hum_out:
+            await buzzer_tone(900, 0.4)
+        elif lux_out:
+            await buzzer_tone(700, 0.4)
+    except Exception:
+        try:
+            buzzer.duty_u16(0)
+        except:
+            pass
+
+# helper to start/stop buzzer task safely
+def start_buzzer_if_needed(temp_out, hum_out, lux_out):
+    global buzzer_task
+    # if alarms are silenced do not start
+    if state["alarm_silenced"]:
+        return
+    # if there is already a running buzzer task, don't start another
+    if buzzer_task is not None and not buzzer_task.done():
+        return
+    # create new task
+    try:
+        buzzer_task = asyncio.create_task(buzzer_alarm_pattern_async(temp_out, hum_out, lux_out))
+    except Exception:
+        pass
+
+# ------------- TELEGRAM (optional) -------------
+try:
+    import urequests as requests
+except Exception:
+    requests = None
+
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else None
+
+async def telegram_poll():
+    last_update = 0
+    if not requests or not TG_API:
+        while True:
+            await asyncio.sleep(5)
+    while True:
+        try:
+            url = f"{TG_API}/getUpdates?timeout=10&offset={last_update+1}"
+            r = requests.get(url)
+            data = None
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+            try:
+                r.close()
+            except:
+                pass
+            if data and "result" in data:
+                for item in data["result"]:
+                    last_update = item.get("update_id", last_update)
+                    msg = item.get("message")
+                    if not msg:
+                        continue
+                    text = msg.get("text","")
+                    # commands
+                    if text.startswith("/status"):
+                        s = f"Temp:{state['temp']}C Hum:{state['hum']}% Lux:{state['lux']}\nAlarm:{state['alarm_active']} Silenced:{state['alarm_silenced']}"
+                        await send_telegram(s)
+                    elif text.startswith("/silence"):
+                        state["alarm_silenced"] = True
+                        await send_telegram("Alarmas silenciadas")
+                    elif text.startswith("/unsilence"):
+                        state["alarm_silenced"] = False
+                        await send_telegram("Alarmas reactivadas")
+                    elif text.startswith("/set"):
+                        parts = text.split()
+                        if len(parts) == 3:
+                            key = parts[1]
+                            val = parts[2]
+                            if key in thresholds:
+                                try:
+                                    thresholds[key] = float(val)
+                                    save_thresholds()
+                                    await send_telegram(f"Umbral {key} actualizado a {val}")
+                                except:
+                                    await send_telegram("Valor inválido")
+                            else:
+                                await send_telegram("Umbral desconocido. Usa: " + ", ".join(thresholds.keys()))
+                    else:
+                        p = text.split()
+                        if len(p) == 2 and p[0] in thresholds:
+                            try:
+                                thresholds[p[0]] = float(p[1])
+                                save_thresholds()
+                                await send_telegram(f"Umbral {p[0]}={p[1]}")
+                            except:
+                                await send_telegram("Valor inválido")
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+async def send_telegram(msg):
+    if not requests or not TG_API:
+        return False
+    try:
+        requests.post(f"{TG_API}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        return True
+    except Exception:
+        return False
+
+# ------------- SENSOR TASK -------------
+async def sensor_loop():
+    global buzzer_task
+    while True:
+        # read DHT
+        try:
+            dht_sensor.measure()
+            t = dht_sensor.temperature()
+            h = dht_sensor.humidity()
+        except Exception:
+            t, h = None, None
+        # read lux if available
+        lux = None
+        if light_sensor:
+            try:
+                lux = light_sensor.luminance()
+            except Exception:
+                lux = None
+        # presence
+        presence = bool(pir.value())
+
+        state["temp"] = t
+        state["hum"] = h
+        state["lux"] = lux
+        state["presence"] = presence
+
+        # evaluate alarms
+        temp_out = t is not None and (t > thresholds["temp_high"] or t < thresholds["temp_low"])
+        hum_out = h is not None and (h > thresholds["hum_high"] or h < thresholds["hum_low"])
+        lux_out = lux is not None and (lux < thresholds["lux_low"])
+        any_alarm = temp_out or hum_out or lux_out or state["panic"]
+
+        # if alarms are silenced, don't mark active
+        state["alarm_active"] = any_alarm and not state["alarm_silenced"]
+
+        # leds (use value)
+        try:
+            led_off(led_green); led_off(led_pink); led_off(led_red)
+            if presence:
+                led_on(led_pink)
+            elif state["alarm_active"]:
+                led_on(led_red)
+            else:
+                led_on(led_green)
+        except Exception:
+            pass
+
+        # servo rotate if temp_out
+        try:
+            servo_set(90 if temp_out else 0)
+        except Exception:
+            pass
+
+        # buzzer: start async buzzer pattern if alarm active and not silenced
+        if state["alarm_active"] and not state["alarm_silenced"]:
+            start_buzzer_if_needed(temp_out, hum_out, lux_out)
+        else:
+            # cancel buzzer task if running
+            try:
+                if buzzer_task is not None and not buzzer_task.done():
+                    buzzer_task.cancel()
+                    buzzer.duty_u16(0)
+            except Exception:
+                pass
+
+        await asyncio.sleep(SAMPLE_INTERVAL)
+
+# ------------- WEB SERVER -------------
+HTML_PAGE = """<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Domótica Quirófano</title>
+<style>
+body{font-family:Arial,system-ui;max-width:900px;margin:auto;padding:12px;background:#f4f6f8}
+.card{background:#fff;padding:12px;border-radius:10px;margin:10px 0;box-shadow:0 6px 18px rgba(15,15,15,0.06)}
+.h1{font-size:20px;margin:0 0 8px}
+.bad{color:#d9534f;font-weight:700}.ok{color:#28a745;font-weight:700}.presence{color:#e83e8c;font-weight:700}
+.btn{padding:8px 12px;border-radius:6px;border:0;cursor:pointer;margin-right:8px}
+.sil{background:#d9534f;color:#fff}.uns{background:#28a745;color:#fff}
+.small{font-size:13px;color:#666}
+</style>
+</head><body>
+<h2>Domótica — Quirófano</h2>
+<div class="card" id="status">Cargando...</div>
+<div class="card">
+<button class="btn sil" onclick="fetch('/silence')">Silenciar Alarmas</button>
+<button class="btn uns" onclick="fetch('/unsilence')">Reactivar Alarmas</button>
+<p class="small">Cambia umbrales desde Telegram: /set temp_high 28</p>
+</div>
+<script>
+async function refresh(){
+  try{
+    const r = await fetch('/api');
+    const j = await r.json();
+    let s = <b>Temperatura:</b> ${j.temp===null?'--':j.temp} °C<br>;
+    s += <b>Humedad:</b> ${j.hum===null?'--':j.hum} %<br>;
+    s += <b>Luz:</b> ${j.lux===null?'--':j.lux} lx<br>;
+    s += <b>Presencia:</b> ${j.presence?'<span class="presence">Sí</span>':'No'}<br>;
+    s += <b>Alarma activa:</b> ${j.alarm_active?'<span class="bad">SI</span>':'<span class="ok">NO</span>'}<br>;
+    s += <b>Alarma silenciada:</b> ${j.alarm_silenced?'SI':'NO'}<br>;
+    s += <b>Última alarma:</b> ${j.last_alarm||'-'}<br>;
+    s += <h4>Umbrales</h4>;
+    s += Temp: ${j.thresholds.temp_low} - ${j.thresholds.temp_high} °C<br>;
+    s += Hum: ${j.thresholds.hum_low} - ${j.thresholds.hum_high} %<br>;
+    s += Lux min: ${j.thresholds.lux_low} lx<br>;
+    document.getElementById('status').innerHTML = s;
+  }catch(e){
+    document.getElementById('status').innerHTML = "Error cargando datos";
+  }
+}
+setInterval(refresh,3000);
+refresh();
+</script>
+</body></html>"""
+
+async def handle_client(reader, writer):
+    try:
+        line = await reader.readline()
+        if not line:
+            await writer.aclose(); return
+        request_line = line.decode()
+        # read rest of headers
+        while True:
+            h = await reader.readline()
+            if not h or h == b'\r\n':
+                break
+        # get path
+        parts = request_line.split(" ")
+        path = parts[1] if len(parts) > 1 else "/"
+        # actions
+        if path.startswith("/silence"):
+            state["alarm_silenced"] = True
+        if path.startswith("/unsilence"):
+            state["alarm_silenced"] = False
+        if path.startswith("/api"):
+            payload = {
+                "temp": state["temp"],
+                "hum": state["hum"],
+                "lux": state["lux"],
+                "presence": state["presence"],
+                "alarm_active": state["alarm_active"],
+                "alarm_silenced": state["alarm_silenced"],
+                "last_alarm": state["last_alarm"],
+                "thresholds": thresholds
+            }
+            body = ujson.dumps(payload)
+            await writer.awrite("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+            await writer.awrite(body)
+        else:
+            await writer.awrite("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
+            await writer.awrite(HTML_PAGE)
+        await writer.aclose()
+    except Exception as e:
+        try:
+            await writer.aclose()
+        except:
+            pass
+
+# ------------- BUTTON IRQS -------------
+def silence_isr(pin):
+    state["alarm_silenced"] = True
+
+def panic_isr(pin):
+    state["panic"] = True
+    state["last_alarm"] = "BOTÓN PÁNICO"
+    try:
+        asyncio.create_task(send_telegram("!! PÁNICO activado !!"))
+    except Exception:
+        pass
+
+btn_silence.irq(trigger=Pin.IRQ_FALLING, handler=silence_isr)
+btn_panic.irq(trigger=Pin.IRQ_FALLING, handler=panic_isr)
+
+# ------------- STARTUP & RUN -------------
+async def main():
+    global light_sensor
+    load_thresholds()
+    ip = wifi_connect_blocking()
+    if ip:
+        try:
+            asyncio.create_task(send_telegram(f"ESP32 {DEVICE_ID} online, IP: {ip}"))
+        except:
+            pass
+    try:
+        devs = i2c.scan()
+        print("I2C scan:", devs)
+        if 0x23 in devs or 35 in devs:
+            light_sensor = BH1750(i2c, addr=0x23)
+            print("BH1750 detected")
+        else:
+            light_sensor = None
+            print("BH1750 not found")
+    except Exception as e:
+        print("I2C scan error:", e)
+        light_sensor = None
+
+    asyncio.create_task(sensor_loop())
+    asyncio.create_task(telegram_poll())
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 80)
+    print("Web server started on port 80")
+    await server.wait_closed()
+
+# run
+try:
+    asyncio.run(main())
+finally:
+    try:
+        asyncio.new_event_loop()
+    except:
+        pass
